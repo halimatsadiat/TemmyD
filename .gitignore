@@ -1,0 +1,8 @@
+node_modules/
+data/
+uploads/
+*.tar.gz
+.env
+release/
+*-preview.png
+paystack-settings.png
