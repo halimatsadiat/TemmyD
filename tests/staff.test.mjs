@@ -1,0 +1,40 @@
+import {test} from 'node:test';
+import assert from 'node:assert/strict';
+import {spawn} from 'node:child_process';
+import {mkdtempSync,rmSync} from 'node:fs';
+import {tmpdir} from 'node:os';
+import path from 'node:path';
+test('staff invitations, role boundaries, assignments and revocation',async()=>{
+ const dir=mkdtempSync(path.join(tmpdir(),'temmyd-staff-'));const server=spawn(process.execPath,['server.mjs'],{env:{...process.env,PORT:'4196',DATA_DIR:dir},stdio:['ignore','pipe','pipe']});
+ try{await new Promise((resolve,reject)=>{let errors='';server.stderr.on('data',d=>errors+=d);const t=setTimeout(()=>reject(Error(errors||'Server timeout')),10000);server.stdout.once('data',()=>{clearTimeout(t);resolve()});server.once('exit',()=>{clearTimeout(t);reject(Error(errors))})});
+ async function call(route,method='GET',body,cookie){const r=await fetch('http://127.0.0.1:4196'+route,{method,headers:{'Content-Type':'application/json',...(cookie?{cookie}:{})},body:body?JSON.stringify(body):undefined});return{status:r.status,data:await r.json(),cookie:r.headers.get('set-cookie')?.split(';')[0]}}
+ const create=async(name,route='/api/register')=>call(route,'POST',{name,email:name+'@example.test',password:'DisposablePassword123'});
+ const owner=(await create('owner','/api/setup')).cookie;let manager=await create('manager'),driver=await create('driver');const customer=await create('customer');
+ assert.equal((await call('/api/admin/staff','GET',null,customer.cookie)).status,403);
+ let invite=await call('/api/admin/staff/invites','POST',{email:'manager@example.test',role:'manager'},owner);assert.equal(invite.status,201);const token=new URL(invite.data.joinPath,'http://test').searchParams.get('token');
+ assert.equal((await call('/api/staff/accept','POST',{token},driver.cookie)).status,403);
+ let accepted=await call('/api/staff/accept','POST',{token},manager.cookie);assert.equal(accepted.status,200);manager.cookie=accepted.cookie;
+ assert.equal((await call('/api/staff/accept','POST',{token},manager.cookie)).status,400);
+ assert.equal((await call('/api/admin/categories','POST',{name:'Manager cakes'},manager.cookie)).status,201);
+ for(const route of ['/api/admin/staff','/api/admin/customers','/api/admin/payments'])assert.equal((await call(route,'GET',null,manager.cookie)).status,403);
+ assert.equal((await call('/api/admin/settings','PATCH',{},manager.cookie)).status,403);
+ invite=await call('/api/admin/staff/invites','POST',{email:'driver@example.test',role:'delivery'},owner);accepted=await call('/api/staff/accept','POST',{token:new URL(invite.data.joinPath,'http://test').searchParams.get('token')},driver.cookie);driver.cookie=accepted.cookie;
+ const cake=(await call('/api/cakes')).data[0];const order=await call('/api/orders','POST',{phone:'08012345678',date:'2030-12-20',fulfilment:'Delivery',address:'10 Cake Lane',items:[{cakeId:cake.id,size:6,qty:1}]},customer.cookie);const oid=order.data.id;
+ assert.equal((await call('/api/admin/orders','GET',null,driver.cookie)).data.length,0);
+ assert.equal((await call('/api/orders/'+oid,'GET',null,driver.cookie)).status,404);
+ assert.equal((await call('/api/admin/orders/'+oid,'PATCH',{payment:'Paid'},manager.cookie)).status,403);
+ assert.equal((await call('/api/admin/orders/'+oid,'PATCH',{status:'Ready',assignedTo:driver.data.user.id},manager.cookie)).status,200);
+ const delivery=(await call('/api/admin/orders','GET',null,driver.cookie)).data[0];assert.equal(delivery.id,oid);for(const key of ['payment','total','email','user_id','notes','paymentDetails'])assert.equal(delivery[key],undefined);
+ assert.equal((await call('/api/orders/'+oid,'GET',null,driver.cookie)).data.total,undefined);
+ assert.equal((await call('/api/admin/cakes','GET',null,driver.cookie)).status,403);
+ assert.equal((await call('/api/admin/orders/'+oid,'PATCH',{status:'Delivered'},driver.cookie)).status,400);
+ assert.equal((await call('/api/admin/orders/'+oid,'PATCH',{payment:'Paid'},driver.cookie)).status,403);
+ assert.equal((await call('/api/admin/orders/'+oid,'PATCH',{status:'Out for delivery',message:'On the way'},driver.cookie)).status,200);
+ assert.equal((await call('/api/admin/orders/'+oid,'PATCH',{status:'Delivered'},driver.cookie)).status,200);
+ assert.equal((await call('/api/orders/'+oid,'GET',null,customer.cookie)).data.status,'Delivered');
+ assert.equal((await call('/api/admin/staff/'+driver.data.user.id,'PATCH',{role:'customer'},owner)).status,200);
+ assert.equal((await call('/api/admin/orders','GET',null,driver.cookie)).status,401);
+ const ownerId=(await call('/api/session','GET',null,owner)).data.user.id;assert.equal((await call('/api/admin/staff/'+ownerId,'PATCH',{role:'manager'},owner)).status,400);
+ invite=await call('/api/admin/staff/invites','POST',{email:'customer@example.test',role:'manager'},owner);assert.equal((await call('/api/admin/staff/invites/'+invite.data.id,'DELETE',null,owner)).status,200);assert.equal((await call('/api/staff/accept','POST',{token:new URL(invite.data.joinPath,'http://test').searchParams.get('token')},customer.cookie)).status,400);
+ }finally{server.kill();await new Promise(r=>server.once('exit',r));rmSync(dir,{recursive:true,force:true})}
+});
