@@ -8,6 +8,7 @@ export async function recovery({db,body,json,fail,passwordHash,mail}){
   if(!['/api/forgot-password','/api/reset-password'].includes(route)||method!=='POST')return false;
   const b=await body(req);const generic={message:'If an account exists for this email, a reset link will be sent. Check your inbox and spam folder.'};
   if(route==='/api/forgot-password'){
+   const started=Date.now();
    const email=typeof b.email==='string'?b.email.trim().toLowerCase().slice(0,254):'';
    const ipOK=await limit('request-ip:'+req.socket.remoteAddress,60),emailOK=ipOK?await limit('request-email:'+email,3):false;
    if(ipOK&&emailOK&&/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)){
@@ -19,7 +20,7 @@ export async function recovery({db,body,json,fail,passwordHash,mail}){
      await db.prepare('INSERT INTO password_resets VALUES(?,?,?,NULL,?)').run(hash(token),u.id,expires,emailId);await db.exec('COMMIT');
     }catch(e){await db.exec('ROLLBACK');throw e}}
    }
-   json(res,generic);return true;
+   if(ipOK)await new Promise(resolve=>setTimeout(resolve,Math.max(0,200-(Date.now()-started))));json(res,generic);return true;
   }
   if(!await limit('reset-ip:'+req.socket.remoteAddress,30))fail(429,'Too many attempts. Try again later.');
   if(typeof b.token!=='string'||!/^[a-f0-9]{64}$/.test(b.token)||typeof b.password!=='string'||b.password.length<10||b.password.length>128)fail(400,'Use a valid reset link and a password of 10–128 characters.');
