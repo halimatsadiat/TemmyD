@@ -4,10 +4,11 @@ Email defaults to **preview mode**. No credentials are needed and no mail is sen
 
 ## Real delivery later
 
-The backend supports Resend over HTTPS. Verify a sender domain with Resend, then privately configure these server environment variables:
+The backend supports Brevo and Resend over HTTPS. See BREVO.md for the Brevo setup. For Resend, verify a sender domain, then privately configure these server environment variables:
 
 ```
 RESEND_API_KEY=<your private Resend API key>
+EMAIL_PROVIDER=resend
 EMAIL_FROM=Temmyd Cakes <orders@your-verified-domain.com>
 EMAIL_ENABLED=true
 APP_URL=https://your-bakery-site.example

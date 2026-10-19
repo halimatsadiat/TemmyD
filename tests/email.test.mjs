@@ -29,3 +29,14 @@ test('temporary failures retry without exposing provider secrets; revoked invita
  await mail.invite('staff@example.test','manager','/staff/join?token=private','revoked-id');await mail.drain();job=db.prepare('SELECT * FROM email_outbox WHERE invite_id=?').get('revoked-id');assert.equal(job.status,'cancelled');assert.equal(job.content,'');
  }finally{db.close()}
 });
+test('Brevo uses its API key, verified sender, reply-to and stable idempotency key',async()=>{
+ const requests=[];const {db,mail}=await fixture({EMAIL_PROVIDER:'brevo',BREVO_API_KEY:'brevo-private',EMAIL_FROM:'Temmyd Cakes <verified@example.test>',EMAIL_ENABLED:'true',APP_URL:'https://bakery.example.test'},async(url,opts)=>{requests.push({url,...opts});return{ok:true,json:async()=>({messageId:'<brevo-message@example.test>'})}});try{
+ const id=await mail.queue('customer@example.test','Order received','<Customer content>');await mail.drain();await mail.drain();assert.equal(requests.length,1);const req=requests[0],data=JSON.parse(req.body);assert.equal(req.url,'https://api.brevo.com/v3/smtp/email');assert.equal(req.headers['api-key'],'brevo-private');assert.equal(req.headers.Authorization,undefined);assert.deepEqual(data.sender,{name:'Temmyd Cakes',email:'verified@example.test'});assert.equal(data.replyTo.email,'verified@example.test');assert.equal(data.to[0].email,'customer@example.test');assert.equal(data.headers.idempotencyKey,'temmyd-email-'+id);assert.match(data.htmlContent,/&lt;Customer content&gt;/);assert.equal(mail.info().provider,'Brevo');assert.equal(db.prepare('SELECT provider_id FROM email_outbox').get().provider_id,'<brevo-message@example.test>');
+ }finally{db.close()}
+});
+test('Brevo retries stop before its deduplication window expires; missing sender stays in preview',async()=>{
+ let count=0;const {db,mail}=await fixture({EMAIL_PROVIDER:'brevo',BREVO_API_KEY:'private',EMAIL_FROM:'owner@example.test',EMAIL_ENABLED:'true',APP_URL:'https://bakery.example.test'},async()=>{count++;return{ok:false,status:503}});try{
+ const id=await mail.queue('customer@example.test','Test','Body');await mail.drain();assert.equal(count,1);db.prepare('UPDATE email_attempt_windows SET started_at=? WHERE email_id=?').run(Date.now()-11*60000,id);db.prepare('UPDATE email_outbox SET next_attempt=0 WHERE id=?').run(id);await mail.drain();assert.equal(count,1);assert.equal(db.prepare('SELECT status FROM email_outbox').get().status,'failed');
+ }finally{db.close()}
+ const missing=await fixture({EMAIL_PROVIDER:'brevo',BREVO_API_KEY:'private',EMAIL_ENABLED:'true'});try{assert.equal(missing.mail.info().enabled,false);await missing.mail.queue('customer@example.test','Test','Body');await missing.mail.drain();assert.equal(missing.db.prepare('SELECT status FROM email_outbox').get().status,'preview')}finally{missing.db.close()}
+});
