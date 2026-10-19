@@ -3,7 +3,8 @@ import {randomBytes} from 'node:crypto';
 const escape=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 export async function emailService({db,json,body,requireUser,fail,env=process.env,fetcher=fetch}){
  await db.exec(`CREATE TABLE IF NOT EXISTS email_outbox(id TEXT PRIMARY KEY,recipient TEXT NOT NULL,subject TEXT NOT NULL,content TEXT NOT NULL,status TEXT NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,next_attempt INTEGER NOT NULL,created_at TEXT NOT NULL,provider_id TEXT NOT NULL DEFAULT '',last_error TEXT NOT NULL DEFAULT '',invite_id TEXT NOT NULL DEFAULT '');
- CREATE TABLE IF NOT EXISTS email_attempt_windows(email_id TEXT PRIMARY KEY,started_at INTEGER NOT NULL);`);
+ CREATE TABLE IF NOT EXISTS email_attempt_windows(email_id TEXT PRIMARY KEY,started_at INTEGER NOT NULL);
+ CREATE TABLE IF NOT EXISTS email_secrets(email_id TEXT PRIMARY KEY,expires INTEGER NOT NULL);`);
  const origin=env.APP_URL||env.RENDER_EXTERNAL_URL||'http://127.0.0.1:4174';
  const provider=(env.EMAIL_PROVIDER||'resend').toLowerCase();
  const senderMatch=(env.EMAIL_FROM||'').trim().match(/^(?:([^<>\r\n]+)\s*<([^<>\s]+@[^<>\s]+)>|([^<>\s]+@[^<>\s]+))$/);
@@ -13,8 +14,8 @@ export async function emailService({db,json,body,requireUser,fail,env=process.en
  let validOrigin=false;try{const u=new URL(origin);validOrigin=!u.username&&!u.password&&u.pathname==='/'&&!u.search&&!u.hash&&(u.protocol==='https:'||!env.RENDER&&['localhost','127.0.0.1'].includes(u.hostname)&&u.protocol==='http:')}catch{}
  const enabled=env.EMAIL_ENABLED==='true'&&configured&&validOrigin;
  const info=()=>({provider:providerName,configured,enabled,mode:enabled?'sending':'preview',from:env.EMAIL_FROM||'',origin,originValid:validOrigin});
- async function queue(recipient,subject,content,inviteId=''){
-  const id=randomBytes(16).toString('hex');await db.prepare('INSERT INTO email_outbox(id,recipient,subject,content,status,next_attempt,created_at,invite_id) VALUES(?,?,?,?,?,?,?,?)').run(id,recipient,subject,content,enabled?'queued':'preview',Date.now(),new Date().toISOString(),inviteId);return id;
+ async function queue(recipient,subject,content,inviteId='',secretExpires=0){
+  const id=randomBytes(16).toString('hex');await db.prepare('INSERT INTO email_outbox(id,recipient,subject,content,status,next_attempt,created_at,invite_id) VALUES(?,?,?,?,?,?,?,?)').run(id,recipient,subject,content,enabled?'queued':'preview',Date.now(),new Date().toISOString(),inviteId);if(secretExpires)await db.prepare('INSERT INTO email_secrets VALUES(?,?)').run(id,secretExpires);return id;
  }
  async function orderEvent(orderId,status,message){
   const o=await db.prepare('SELECT * FROM orders WHERE id=?').get(orderId);if(!o)return;
@@ -33,6 +34,7 @@ export async function emailService({db,json,body,requireUser,fail,env=process.en
    if(provider==='brevo'&&Date.now()-window.started_at>10*60000){await db.prepare("UPDATE email_outbox SET status='failed',last_error=? WHERE id=?").run('Retry window expired. Check Brevo logs before sending another notification.',job.id);continue;}
    if(Date.now()-Date.parse(job.created_at)>23*3600000){await db.prepare("UPDATE email_outbox SET status='failed',last_error=? WHERE id=?").run('Sending window expired. Create a fresh notification.',job.id);continue;}
    if(job.invite_id){const active=await db.prepare('SELECT id FROM staff_invites WHERE id=? AND revoked=0 AND used_at IS NULL AND expires>?').get(job.invite_id,Date.now());if(!active){await db.prepare("UPDATE email_outbox SET status='cancelled',content='' WHERE id=?").run(job.id);continue;}}
+   const secret=await db.prepare('SELECT expires FROM email_secrets WHERE email_id=?').get(job.id);if(secret&&secret.expires<=Date.now()){await db.prepare("UPDATE email_outbox SET status='cancelled',content='' WHERE id=?").run(job.id);continue;}
    try{
     const html=`<div style="font-family:Arial,sans-serif;max-width:600px;margin:auto;color:#234432"><h1>Temmyd Cakes</h1><div style="white-space:pre-wrap;line-height:1.6">${escape(job.content)}</div></div>`;
     const brevo=provider==='brevo';const key='temmyd-email-'+job.id;
@@ -40,7 +42,7 @@ export async function emailService({db,json,body,requireUser,fail,env=process.en
     const r=await fetcher(brevo?'https://api.brevo.com/v3/smtp/email':'https://api.resend.com/emails',{method:'POST',headers:{'Content-Type':'application/json',...(brevo?{'api-key':env.BREVO_API_KEY}:{Authorization:'Bearer '+env.RESEND_API_KEY,'Idempotency-Key':key})},body:JSON.stringify(payload),signal:AbortSignal.timeout(15000)});
     if(!r.ok){const e=new Error('Email provider returned HTTP '+r.status);e.retry=r.status===429||r.status>=500;throw e;}
     const result=await r.json();const providerId=brevo?result.messageId:result.id;if(typeof providerId!=='string')throw Error('Email provider response was incomplete.');
-    await db.prepare("UPDATE email_outbox SET status='sent',provider_id=?,last_error='',content=? WHERE id=?").run(providerId,job.invite_id?'Invitation submitted. Link hidden for security.':job.content,job.id);
+    await db.prepare("UPDATE email_outbox SET status='sent',provider_id=?,last_error='',content=? WHERE id=?").run(providerId,job.invite_id||secret?'Private link submitted. Link hidden for security.':job.content,job.id);
    }catch(e){const retry=e.retry!==false&&job.attempts<4;await db.prepare('UPDATE email_outbox SET status=?,next_attempt=?,last_error=? WHERE id=?').run(retry?'queued':'failed',Date.now()+Math.min(3600000,60000*2**job.attempts),e.message.startsWith('Email provider returned HTTP ')?e.message:'Email provider could not be reached. Check configuration and retry.',job.id);}
   }
  }
