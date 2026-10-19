@@ -1,4 +1,5 @@
 import http from 'node:http';
+import {emailService} from './email.mjs';
 import {staffService,staffRoles,deliveryOrder} from './staff.mjs';
 import {database} from './database.mjs';
 import {photoStorage} from './photo-storage.mjs';
@@ -36,14 +37,16 @@ function json(res,data,status=200,extra={}){res.writeHead(status,{'Content-Type'
 async function body(req,limit=100000){const chunks=[];let size=0;for await(const chunk of req){size+=chunk.length;if(size>limit)fail(413,'File or request is too large.');chunks.push(chunk)}try{return JSON.parse(Buffer.concat(chunks).toString()||'{}')}catch{fail(400,'Invalid request data.')}}
 async function session(res,req,u){const token=randomBytes(32).toString('hex');(await db.prepare('DELETE FROM sessions WHERE expires<?').run(Date.now()));(await db.prepare('INSERT INTO sessions VALUES(?,?,?)').run(hash(token),u.id,Date.now()+7*86400000));res.setHeader('Set-Cookie',`temmyd_session=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800${process.env.NODE_ENV==='production'?'; Secure':''}`)}
 async function safeOrder(o,details=true){if(!o)return null;return {...o,paymentDetails:(await paymentService.detail(o.id)),items:JSON.parse(o.items),...(details?{events:(await db.prepare('SELECT status,message,created_at FROM events WHERE order_id=? ORDER BY id').all(o.id))}:{})}}
-async function addEvent(order,status,message){(await db.prepare('INSERT INTO events(order_id,status,message,created_at) VALUES(?,?,?,?)').run(order,status,message,now()))}
+async function addEvent(order,status,message){(await db.prepare('INSERT INTO events(order_id,status,message,created_at) VALUES(?,?,?,?)').run(order,status,message,now()));await mail.orderEvent(order,status,message)}
 async function minimumDate(){const local=new Intl.DateTimeFormat('en-CA',{timeZone:'Africa/Lagos',year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date());const d=new Date(local+'T12:00:00Z');d.setUTCDate(d.getUTCDate()+Number((await settings()).lead_days));return d.toISOString().slice(0,10)}
+const mail=await emailService({db,json,body,requireUser,fail});
 const paymentService=(await payments({db,data,json,body,requireUser,fail,addEvent,update}));
-const staff=await staffService({db,body,json,requireUser,session,fail,update});
+const staff=await staffService({db,body,json,requireUser,session,fail,update,mail});
 const server=http.createServer((req,res)=>db.withContext(async()=>{res.setHeader('X-Content-Type-Options','nosniff');res.setHeader('Referrer-Policy','same-origin');res.setHeader('X-Frame-Options','DENY');try{
 const url=new URL(req.url,'http://localhost');const route=url.pathname;const method=req.method;
 if(route.startsWith('/api/')){
 if(!['GET','HEAD'].includes(method)&&req.headers.origin){if(new URL(req.headers.origin).host!==req.headers.host)fail(403,'Cross-origin request rejected.')}
+if(await mail.handle(req,res,route,method))return;
 if(await paymentService.handle(req,res,route,method))return;
 if(await staff.handle(req,res,route,method))return;
 if(route==='/api/health'&&method==='GET'){(await db.prepare('SELECT 1').get());return json(res,{status:'ok'})}
@@ -91,3 +94,5 @@ if(route.startsWith('/uploads/')){const file=route.slice(9);if(!/^[a-f0-9]+\.(jp
 const filename=['/app.js','/style.css'].includes(route)?route.slice(1):'index.html';res.writeHead(200,{'Content-Type':filename.endsWith('.js')?'text/javascript':filename.endsWith('.css')?'text/css':'text/html','Cache-Control':'no-cache'});res.end(readFileSync(path.join(root,'web',filename)));
 }catch(e){if(!res.headersSent)json(res,{error:e.status?e.message:'Something went wrong. Please try again.'},e.status||500);else res.end();if(!e.status)console.error('Request failed:',e.code||'internal')}}));
 server.listen(Number(process.env.PORT||4174),process.env.HOST||'127.0.0.1',()=>console.log(`Temmyd bakery: http://${process.env.HOST||'127.0.0.1'}:${process.env.PORT||4174}`));
+
+const emailTimer=setInterval(()=>db.withContext(()=>mail.drain()).catch(()=>console.error('Email queue processing failed.')),30000);emailTimer.unref();
