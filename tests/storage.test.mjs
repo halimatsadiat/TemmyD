@@ -1,0 +1,7 @@
+import {test} from 'node:test';
+import assert from 'node:assert/strict';
+import {photoStorage} from '../photo-storage.mjs';
+const env={RENDER:'true',SUPABASE_URL:'https://project.supabase.co',SUPABASE_SERVICE_ROLE_KEY:'test-only-storage-key'};
+test('existing private bucket is reused instead of being created again',async()=>{const requests=[];const storage=await photoStorage('',{env,fetcher:async(url,options)=>{requests.push({url,options});return Response.json({id:'cake-photos',public:false})}});assert.equal(typeof storage.save,'function');assert.equal(requests.length,1);assert.match(requests[0].url,/bucket\/cake-photos$/);assert.notEqual(requests[0].options.method,'POST')});
+test('missing bucket is created privately with image limits',async()=>{let calls=0;await photoStorage('',{env,fetcher:async(url,options)=>{if(++calls===1)return Response.json({statusCode:'404'},{status:400});const payload=JSON.parse(options.body);assert.equal(payload.public,false);assert.equal(payload.file_size_limit,4000000);return Response.json({name:'cake-photos'})}});assert.equal(calls,2)});
+test('invalid key errors expose status only, never the storage secret',async()=>{await assert.rejects(photoStorage('',{env,fetcher:async()=>Response.json({statusCode:'401',message:env.SUPABASE_SERVICE_ROLE_KEY},{status:403})}),e=>e.message.includes('HTTP 403')&&e.message.includes('code 401')&&!e.message.includes(env.SUPABASE_SERVICE_ROLE_KEY))});
